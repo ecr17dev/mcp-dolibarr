@@ -92,17 +92,11 @@ async function loadTools() {
 
 // ============ SERVER SETUP ============
 
-async function main() {
-  console.error('Starting Dolibarr MCP Server (lazy loading)...');
-
-  // Dynamic imports para el SDK de MCP
-  const [{ Server }, { StdioServerTransport }, { ListToolsRequestSchema, CallToolRequestSchema, ListResourcesRequestSchema, ListPromptsRequestSchema }] = await Promise.all([
+async function createServer() {
+  const [{ Server }, { ListToolsRequestSchema, CallToolRequestSchema, ListResourcesRequestSchema, ListPromptsRequestSchema }] = await Promise.all([
     import('@modelcontextprotocol/sdk/server/index.js'),
-    import('@modelcontextprotocol/sdk/server/stdio.js'),
     import('@modelcontextprotocol/sdk/types.js'),
   ]);
-
-  const { setConfig } = await import('./config/index.js');
 
   const server = new Server(
     { name: 'dolibarr-mcp-server', version: '1.0.0' },
@@ -150,7 +144,11 @@ async function main() {
     ]
   }));
 
-  // Config from environment
+  return server;
+}
+
+async function applyEnvConfig() {
+  const { setConfig } = await import('./config/index.js');
   const envApiKey = process.env.DOLIBARR_API_KEY;
   const envUrl = process.env.DOLIBARR_URL;
 
@@ -161,10 +159,82 @@ async function main() {
     setConfig({ baseUrl: 'https://bluesmile.platform.cl/api/index.php', apiKey: envApiKey, entity: '0' });
     console.error('Configured with default URL');
   }
+}
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+// Streamable HTTP (stateless): un Server nuevo por request. Protegido con MCP_AUTH_TOKEN.
+async function startHttp() {
+  const [{ createServer: createHttpServer }, { StreamableHTTPServerTransport }] = await Promise.all([
+    import('node:http'),
+    import('@modelcontextprotocol/sdk/server/streamableHttp.js'),
+  ]);
+
+  const port = Number(process.env.PORT) || 3000;
+  const authToken = process.env.MCP_AUTH_TOKEN;
+  if (!authToken) {
+    console.error('WARNING: MCP_AUTH_TOKEN not set, /mcp endpoint is unauthenticated');
+  }
+
+  const httpServer = createHttpServer(async (req, res) => {
+    const url = new URL(req.url || '/', 'http://localhost');
+
+    if (url.pathname === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ status: 'ok' }));
+      return;
+    }
+
+    if (url.pathname !== '/mcp') {
+      res.writeHead(404, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Not found' }));
+      return;
+    }
+
+    if (authToken && req.headers.authorization !== `Bearer ${authToken}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'POST' })
+        .end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null }));
+      return;
+    }
+
+    try {
+      const server = await createServer();
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      res.on('close', () => {
+        transport.close();
+        server.close();
+      });
+      await server.connect(transport);
+      await transport.handleRequest(req, res);
+    } catch (error) {
+      console.error('Error handling MCP request:', error);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+          .end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null }));
+      }
+    }
+  });
+
+  httpServer.listen(port, () => console.error(`Dolibarr MCP Server running on http://0.0.0.0:${port}/mcp`));
+}
+
+async function startStdio() {
+  const { StdioServerTransport } = await import('@modelcontextprotocol/sdk/server/stdio.js');
+  const server = await createServer();
+  await server.connect(new StdioServerTransport());
   console.error('Dolibarr MCP Server running on stdio');
+}
+
+async function main() {
+  console.error('Starting Dolibarr MCP Server (lazy loading)...');
+  await applyEnvConfig();
+
+  if (process.env.MCP_TRANSPORT === 'http') {
+    await startHttp();
+  } else {
+    await startStdio();
+  }
 }
 
 main().catch((error) => {
